@@ -110,12 +110,20 @@ function buildStoragePath(userId: string, fileId: string, filename: string): str
  * (the SDK's upload() has no progress callback). Falls back to SDK upload
  * if the session token can't be obtained.
  */
-function uploadWithProgress(
+async function uploadWithProgress(
   storagePath: string,
   file: File,
   accessToken: string,
   onByteProgress?: (fraction: number) => void
 ): Promise<{ ok: boolean; error?: string }> {
+  // Read file data into memory first to avoid mobile WebKit file descriptor streaming resets
+  let payload: BodyInit = file;
+  try {
+    payload = await file.arrayBuffer();
+  } catch {
+    payload = file;
+  }
+
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
     // Encode each path segment individually — keep the `/` separators intact.
@@ -125,7 +133,7 @@ function uploadWithProgress(
     xhr.setRequestHeader('Authorization', `Bearer ${accessToken}`);
     xhr.setRequestHeader('x-upsert', 'false');
     xhr.setRequestHeader('cache-control', '3600');
-    if (file.type) xhr.setRequestHeader('Content-Type', file.type);
+    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && e.total > 0) {
@@ -149,7 +157,11 @@ function uploadWithProgress(
     xhr.onerror = () => resolve({ ok: false, error: 'Network error during upload.' });
     xhr.onabort = () => resolve({ ok: false, error: 'Upload cancelled.' });
 
-    xhr.send(file);
+    try {
+      xhr.send(payload);
+    } catch {
+      resolve({ ok: false, error: 'Network error during upload.' });
+    }
   });
 }
 
@@ -210,6 +222,18 @@ export async function uploadVaultFile(
       uploadResult = await uploadWithProgress(storagePath, file, accessToken, (fraction) =>
         pipelineProgress(fraction, onProgress)
       );
+
+      // Multi-layer fallback for mobile network resiliency:
+      // If direct XHR upload dropped due to mobile browser sandboxing or network abort,
+      // seamlessly retry via Supabase's native SDK upload (fetch + FormData)
+      if (!uploadResult.ok) {
+        console.warn('XHR upload dropped, retrying with Supabase SDK upload:', uploadResult.error);
+        const { error: sdkError } = await supabase.storage
+          .from('vault')
+          .upload(storagePath, file, { cacheControl: '3600', upsert: false });
+        uploadResult = sdkError ? { ok: false, error: sdkError.message } : { ok: true };
+        if (uploadResult.ok) pipelineProgress(1, onProgress);
+      }
     } else {
       const { error: sdkError } = await supabase.storage
         .from('vault')
